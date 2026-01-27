@@ -23,6 +23,19 @@ SMTP relay service that receives E-mails from SMTP clients and sends them to Off
 - Supports multiple SMTP clients
 - Also works with the "Exchange Online Kiosk" plan, which does not support SMTP OAuth authentication (thanks to Graph API)
 
+### Stability Features (v1.1.0)
+
+- **Retry logic** - Automatic retry with exponential backoff for transient Graph API failures (429, 500, 502, 503, 504)
+- **Connection pooling** - HTTP connection reuse for better performance
+- **Graceful shutdown** - Waits for in-flight messages to complete before stopping
+- **Connection limits** - Configurable maximum concurrent connections to prevent resource exhaustion
+- **Message size limits** - Configurable maximum message size (default 25MB per Graph API limit)
+- **Timeouts** - Configurable connection and OAuth2 timeouts
+- **Token cache cleanup** - Automatic cleanup of expired tokens to prevent memory leaks
+- **Panic recovery** - Service continues running even if a handler encounters an unexpected error
+- **Input validation** - Email address validation and command line length limits
+- **Malformed email handling** - Gracefully handles non-standard MIME structures from legacy applications
+
 ## Important
 
 - This is an SMTP relay ONLY! (No IMAP/POP3 support)
@@ -48,7 +61,7 @@ More detailed instructions are provided below.
 
 ```yaml
 log: ""
-log_level: debug
+log_level: info
 listen_addr: 127.0.0.1:2526
 oauth2_config:
   client_id: AzureAppClientID
@@ -59,7 +72,17 @@ oauth2_config:
 fallback_smtp_user:
 fallback_smtp_pass:
 save_to_sent: false
+
+# Stability configuration (optional - all have sensible defaults)
+max_message_size: 26214400      # Max email size in bytes (default: 25MB)
+max_connections: 100            # Max concurrent connections (default: 100)
+connection_timeout: 300         # Connection timeout in seconds (default: 300)
+strict_attachments: false       # Fail if attachment decode fails (default: false)
+retry_attempts: 3               # Graph API retry attempts (default: 3)
+retry_initial_delay: 500        # Initial retry delay in ms (default: 500)
 ```
+
+### Basic Configuration
 
 - `log`: Path to log file. If empty, logs will be printed to stdout.
 - `log_level`: Log level. Can be `debug`, `info`, `warn`, or `error`.
@@ -72,6 +95,17 @@ save_to_sent: false
 - `fallback_smtp_user`: Fallback SMTP user. If set, this user will be used if the SMTP client does not provide a user.
 - `fallback_smtp_pass`: Fallback SMTP password. If set, this password will be used if the SMTP client does not provide a password.
 - `save_to_sent`: If true, the service will save a copy of the sent email to the "Sent Items" folder in Office 365. Default is `false`.
+
+### Stability Configuration (v1.1.0)
+
+All stability options have sensible defaults and are optional. Existing config files will work without changes.
+
+- `max_message_size`: Maximum email size in bytes. Default is `26214400` (25MB), which is the Graph API limit.
+- `max_connections`: Maximum concurrent SMTP connections. Default is `100`. Connections beyond this limit receive a `421` temporary error.
+- `connection_timeout`: Overall connection timeout in seconds. Default is `300` (5 minutes).
+- `strict_attachments`: If `true`, the service will reject emails if any attachment fails to decode. If `false` (default), failed attachments are skipped with a warning.
+- `retry_attempts`: Number of retry attempts for Graph API calls on transient failures. Default is `3`.
+- `retry_initial_delay`: Initial delay in milliseconds before first retry. Uses exponential backoff with jitter. Default is `500`.
 
 ## Usage
 
@@ -95,3 +129,25 @@ save_to_sent: false
 - Set the SMTP server to the address and port specified in `listen_addr` (default is `127.0.0.1:2526`).
 - StartTLS is not supported, so ensure your SMTP client is configured to connect without encryption.
 - If the client provides a username and password, they will be used for authentication. If not, the `fallback_smtp_user` and password will be used.
+
+## Changelog
+
+### v1.1.0
+
+- Added retry logic with exponential backoff for Graph API transient failures
+- Added HTTP connection pooling for improved performance
+- Added graceful shutdown with connection draining
+- Added configurable connection limits
+- Added configurable message size limits
+- Added configurable timeouts for connections and OAuth2 requests
+- Added automatic token cache cleanup
+- Added panic recovery to prevent service crashes
+- Added input validation (email format, command line length)
+- Improved handling of malformed MIME messages from legacy applications
+- Fixed potential hang on malformed multipart boundaries
+- Removed STARTTLS advertisement (was not implemented)
+- Added RSET and NOOP command support
+
+### v1.0.0
+
+- Initial release
