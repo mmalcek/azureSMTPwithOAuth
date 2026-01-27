@@ -18,6 +18,15 @@ type tConfig struct {
 	FallbackSMTPuser string        `yaml:"fallback_smtp_user"`
 	FallbackSMTPpass string        `yaml:"fallback_smtp_pass"`
 	SaveToSent       bool          `yaml:"save_to_sent"`
+
+	// Stability configuration (all have sensible defaults)
+	MaxMessageSize    int64  `yaml:"max_message_size"`    // Max email size in bytes (default 25MB)
+	MaxConnections    int    `yaml:"max_connections"`     // Max concurrent connections (default 100)
+	ConnectionTimeout int    `yaml:"connection_timeout"`  // Connection timeout in seconds (default 300)
+	StrictAttachments bool   `yaml:"strict_attachments"`  // Fail on attachment decode error (default false)
+	RetryAttempts     int    `yaml:"retry_attempts"`      // Graph API retry attempts (default 3)
+	RetryInitialDelay int    `yaml:"retry_initial_delay"` // Initial retry delay in ms (default 500)
+	HealthAddr        string `yaml:"health_addr"`         // Health check endpoint address (optional)
 }
 
 // OAuth2Config holds OAuth2 client configuration
@@ -39,6 +48,23 @@ func loadConfig() error {
 		return err
 	}
 	decryptConfigStrings()
+
+	// Set sensible defaults for stability configuration
+	if config.MaxMessageSize == 0 {
+		config.MaxMessageSize = 25 * 1024 * 1024 // 25MB (Graph API limit)
+	}
+	if config.MaxConnections == 0 {
+		config.MaxConnections = 100
+	}
+	if config.ConnectionTimeout == 0 {
+		config.ConnectionTimeout = 300 // 5 minutes
+	}
+	if config.RetryAttempts == 0 {
+		config.RetryAttempts = 3
+	}
+	if config.RetryInitialDelay == 0 {
+		config.RetryInitialDelay = 500 // 500ms
+	}
 	return nil
 }
 
