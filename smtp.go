@@ -36,6 +36,9 @@ type cachedToken struct {
 	expiresAt time.Time
 }
 
+// maxRecipients limits the number of RCPT TO addresses per message (Graph API limit)
+const maxRecipients = 500
+
 // Shared HTTP clients with connection pooling for better performance
 var (
 	// graphHTTPClient is used for Microsoft Graph API calls
@@ -90,6 +93,10 @@ func isRetryableStatus(status int, retryable []int) bool {
 
 // doWithRetry executes HTTP request with exponential backoff retry
 func doWithRetry(ctx context.Context, client *http.Client, req *http.Request, jsonBody []byte, cfg RetryConfig) (*http.Response, error) {
+	if cfg.MaxAttempts <= 0 {
+		return nil, fmt.Errorf("retry MaxAttempts must be > 0")
+	}
+
 	var lastErr error
 	var resp *http.Response
 
@@ -162,6 +169,7 @@ func handleSMTPConnection(conn net.Conn) {
 
 	var username, password string
 	authenticated := false
+	awaitingAuthData := false
 	var mailFrom string
 	var rcptTo []string
 
@@ -176,7 +184,7 @@ func handleSMTPConnection(conn net.Conn) {
 				fmt.Fprintf(writer, "421 4.4.2 Connection timeout\r\n")
 				writer.Flush()
 			} else {
-				logger.Error("Client read error", "error", err, "remote", conn.RemoteAddr())
+				logger.Debug("Client disconnected", "error", err, "remote", conn.RemoteAddr())
 				fmt.Fprintf(writer, "421 4.7.0 Service not available\r\n")
 				writer.Flush()
 			}
@@ -196,8 +204,13 @@ func handleSMTPConnection(conn net.Conn) {
 			continue
 		}
 
-		// Log the received command
-		logger.Debug("Received SMTP command", "command", line)
+		// Log the received command (mask credentials during AUTH flow)
+		if awaitingAuthData {
+			logger.Debug("Received SMTP command", "command", "***")
+			awaitingAuthData = false
+		} else {
+			logger.Debug("Received SMTP command", "command", line)
+		}
 
 		// Handle EHLO/HELO commands
 		if strings.HasPrefix(strings.ToUpper(line), "EHLO") || strings.HasPrefix(strings.ToUpper(line), "HELO") {
@@ -224,6 +237,7 @@ func handleSMTPConnection(conn net.Conn) {
 				logger.Debug("AUTH LOGIN inline username", "username", username)
 				fmt.Fprintf(writer, "334 UGFzc3dvcmQ6\r\n") // 'Password:' base64
 				writer.Flush()
+				awaitingAuthData = true
 				passB64, err := reader.ReadString('\n')
 				if err != nil {
 					logger.Error("Failed to read password during AUTH", "error", err)
@@ -243,6 +257,7 @@ func handleSMTPConnection(conn net.Conn) {
 				// Standard flow: prompt for username
 				fmt.Fprintf(writer, "334 VXNlcm5hbWU6\r\n") // 'Username:' base64
 				writer.Flush()
+				awaitingAuthData = true
 				userB64, err := reader.ReadString('\n')
 				if err != nil {
 					logger.Error("Failed to read username during AUTH", "error", err)
@@ -262,6 +277,7 @@ func handleSMTPConnection(conn net.Conn) {
 				logger.Debug("AUTH LOGIN username", "username", username)
 				fmt.Fprintf(writer, "334 UGFzc3dvcmQ6\r\n") // 'Password:' base64
 				writer.Flush()
+				awaitingAuthData = true
 				passB64, err := reader.ReadString('\n')
 				if err != nil {
 					logger.Error("Failed to read password during AUTH", "error", err)
@@ -318,10 +334,31 @@ func handleSMTPConnection(conn net.Conn) {
 			continue
 		}
 
+		// Handle QUIT, RSET, NOOP commands
+		if strings.HasPrefix(strings.ToUpper(line), "QUIT") {
+			fmt.Fprintf(writer, "221 2.0.0 Bye\r\n")
+			writer.Flush()
+			return
+		}
+
+		if strings.HasPrefix(strings.ToUpper(line), "RSET") {
+			mailFrom = ""
+			rcptTo = nil
+			fmt.Fprintf(writer, "250 2.0.0 Ok\r\n")
+			writer.Flush()
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToUpper(line), "NOOP") {
+			fmt.Fprintf(writer, "250 2.0.0 Ok\r\n")
+			writer.Flush()
+			continue
+		}
+
 		// Handle MAIL FROM, RCPT TO, DATA commands
 		if strings.HasPrefix(strings.ToUpper(line), "MAIL FROM:") {
 			mailFrom = extractAddress(line)
-			if mailFrom == "" {
+			if mailFrom == "" || !isValidEmail(mailFrom) {
 				fmt.Fprintf(writer, "501 5.1.7 Invalid sender address\r\n")
 				writer.Flush()
 				continue
@@ -335,6 +372,11 @@ func handleSMTPConnection(conn net.Conn) {
 			addr := extractAddress(line)
 			if addr == "" || !isValidEmail(addr) {
 				fmt.Fprintf(writer, "553 5.1.3 Invalid recipient address\r\n")
+				writer.Flush()
+				continue
+			}
+			if len(rcptTo) >= maxRecipients {
+				fmt.Fprintf(writer, "452 4.5.3 Too many recipients\r\n")
 				writer.Flush()
 				continue
 			}
@@ -357,6 +399,7 @@ func handleSMTPConnection(conn net.Conn) {
 
 			var messageSize int64
 			var dataBuffer strings.Builder
+			messageTooLarge := false
 
 			for {
 				// Reset deadline for DATA reading
@@ -386,9 +429,14 @@ func handleSMTPConnection(conn net.Conn) {
 					// Reset for next message attempt
 					mailFrom = ""
 					rcptTo = nil
-					goto continueLoop
+					messageTooLarge = true
+					break
 				}
 				dataBuffer.WriteString(dataLine)
+			}
+
+			if messageTooLarge {
+				continue
 			}
 
 			// Reconstruct message and normalize line endings for MIME parsing
@@ -400,7 +448,7 @@ func handleSMTPConnection(conn net.Conn) {
 			// Parse subject, body, CC, BCC, and attachments
 			subject, body, isHTML, attachments, ccAddrs, bccAddrs, parseErr := parseSubjectBodyAndAttachments(msg)
 			if parseErr != nil {
-				fmt.Fprintf(writer, "550 5.6.0 Message parsing failed: %v\r\n", parseErr)
+				fmt.Fprintf(writer, "550 5.6.0 Message format error\r\n")
 				writer.Flush()
 				logger.Error("MIME parsing failed", "error", parseErr)
 				return
@@ -419,7 +467,7 @@ func handleSMTPConnection(conn net.Conn) {
 
 			if err := sendMailGraphAPI(ctx, token, username, mailFrom, rcptTo, ccAddrs, bccAddrs, subject, body, isHTML, attachments); err != nil {
 				cancel()
-				fmt.Fprintf(writer, "550 5.7.0 Delivery failed: %v\r\n", err)
+				fmt.Fprintf(writer, "550 5.7.0 Delivery failed\r\n")
 				writer.Flush()
 				logger.Error("Failed to send email via Graph API", "error", err, "username", username, "mailFrom", mailFrom, "rcptTo", rcptTo)
 				return
@@ -432,27 +480,6 @@ func handleSMTPConnection(conn net.Conn) {
 			logger.Info("E-mail sent successfully", "username", username, "mailFrom", mailFrom, "rcptTo", rcptTo, "subject", subject)
 			mailFrom = ""
 			rcptTo = nil
-			continue
-		}
-
-	continueLoop:
-		if strings.HasPrefix(strings.ToUpper(line), "QUIT") {
-			fmt.Fprintf(writer, "221 2.0.0 Bye\r\n")
-			writer.Flush()
-			return
-		}
-
-		if strings.HasPrefix(strings.ToUpper(line), "RSET") {
-			mailFrom = ""
-			rcptTo = nil
-			fmt.Fprintf(writer, "250 2.0.0 Ok\r\n")
-			writer.Flush()
-			continue
-		}
-
-		if strings.HasPrefix(strings.ToUpper(line), "NOOP") {
-			fmt.Fprintf(writer, "250 2.0.0 Ok\r\n")
-			writer.Flush()
 			continue
 		}
 
@@ -493,7 +520,12 @@ func extractAddress(line string) string {
 	// fallback: try after colon
 	parts := strings.SplitN(line, ":", 2)
 	if len(parts) == 2 {
-		return strings.TrimSpace(parts[1])
+		addr := strings.TrimSpace(parts[1])
+		// Strip SMTP parameters (e.g., SIZE=12345)
+		if idx := strings.IndexByte(addr, ' '); idx != -1 {
+			addr = addr[:idx]
+		}
+		return addr
 	}
 	return ""
 }
@@ -719,7 +751,7 @@ func decodeMessage(c string, r io.Reader) (content []byte, err error) {
 
 // sendMailGraphAPI sends the email via Microsoft Graph API /sendMail with retry logic
 func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptTo, ccAddrs, bccAddrs []string, subject, body string, isHTML bool, attachments []Attachment) error {
-	graphURL := "https://graph.microsoft.com/v1.0/users/" + sender + "/sendMail"
+	graphURL := "https://graph.microsoft.com/v1.0/users/" + url.PathEscape(sender) + "/sendMail"
 	contentType := "text"
 	if isHTML {
 		contentType = "html"
@@ -735,7 +767,7 @@ func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptT
 		bccSet[strings.ToLower(addr)] = true
 	}
 
-	var toRecipients []map[string]map[string]string
+	toRecipients := make([]map[string]map[string]string, 0)
 	for _, addr := range rcptTo {
 		// Skip addresses that are CC or BCC — they'll be added separately
 		if ccSet[strings.ToLower(addr)] || bccSet[strings.ToLower(addr)] {
@@ -830,7 +862,11 @@ func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptT
 func decodeBase64WithError(s string) (string, error) {
 	b, err := base64.StdEncoding.DecodeString(s)
 	if err != nil {
-		return "", fmt.Errorf("base64 decode failed: %w", err)
+		// Fallback: try without padding (some SMTP clients omit padding)
+		b, err = base64.RawStdEncoding.DecodeString(s)
+		if err != nil {
+			return "", fmt.Errorf("base64 decode failed: %w", err)
+		}
 	}
 	return string(b), nil
 }
@@ -864,7 +900,7 @@ func getCachedOAuth2Token(ctx context.Context, username, password string) (strin
 
 		TokenCache.Store(username, cachedToken{
 			token:     token,
-			expiresAt: time.Now().Add(time.Duration(expiresIn-60) * time.Second), // refresh 1 min before expiry
+			expiresAt: time.Now().Add(time.Duration(max(expiresIn-60, 30)) * time.Second), // refresh 1 min before expiry, minimum 30s cache
 		})
 		logger.Debug("New OAuth2 token cached", "username", username, "expires_in", expiresIn)
 		return token, nil
@@ -917,7 +953,7 @@ func getOAuth2TokenWithExpiry(ctx context.Context, username, password string) (s
 	}
 
 	if err := json.Unmarshal(body, &result); err != nil {
-		return "", 0, fmt.Errorf("failed to parse token response: %w, body: %s", err, string(body))
+		return "", 0, fmt.Errorf("failed to parse token response: %w", err)
 	}
 
 	// Check for OAuth error
@@ -927,34 +963,40 @@ func getOAuth2TokenWithExpiry(ctx context.Context, username, password string) (s
 
 	// Check if access token is present
 	if result.AccessToken == "" {
-		return "", 0, fmt.Errorf("no access token in response, body: %s", string(body))
+		return "", 0, fmt.Errorf("no access token in response (status %d)", resp.StatusCode)
 	}
 
 	logger.Debug("OAuth2 token retrieved", "username", username, "expires_in", result.ExpiresIn)
 	return result.AccessToken, result.ExpiresIn, nil
 }
 
-// StartTokenCacheCleanup starts a background goroutine to clean expired tokens
-func StartTokenCacheCleanup(interval time.Duration) {
+// StartTokenCacheCleanup starts a background goroutine to clean expired tokens.
+// The goroutine stops when the provided context is cancelled.
+func StartTokenCacheCleanup(ctx context.Context, interval time.Duration) {
 	go func() {
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			now := time.Now()
-			var deleted int
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				now := time.Now()
+				var deleted int
 
-			TokenCache.Range(func(key, value interface{}) bool {
-				tok := value.(cachedToken)
-				if now.After(tok.expiresAt) {
-					TokenCache.Delete(key)
-					deleted++
+				TokenCache.Range(func(key, value interface{}) bool {
+					tok := value.(cachedToken)
+					if now.After(tok.expiresAt) {
+						TokenCache.Delete(key)
+						deleted++
+					}
+					return true
+				})
+
+				if deleted > 0 {
+					logger.Debug("Token cache cleanup completed", "deleted", deleted)
 				}
-				return true
-			})
-
-			if deleted > 0 {
-				logger.Debug("Token cache cleanup completed", "deleted", deleted)
 			}
 		}
 	}()

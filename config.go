@@ -25,8 +25,7 @@ type tConfig struct {
 	ConnectionTimeout int    `yaml:"connection_timeout"`  // Connection timeout in seconds (default 300)
 	StrictAttachments bool   `yaml:"strict_attachments"`  // Fail on attachment decode error (default false)
 	RetryAttempts     int    `yaml:"retry_attempts"`      // Graph API retry attempts (default 3)
-	RetryInitialDelay int    `yaml:"retry_initial_delay"` // Initial retry delay in ms (default 500)
-	HealthAddr        string `yaml:"health_addr"`         // Health check endpoint address (optional)
+	RetryInitialDelay int `yaml:"retry_initial_delay"` // Initial retry delay in ms (default 500)
 }
 
 // OAuth2Config holds OAuth2 client configuration
@@ -59,7 +58,7 @@ func loadConfig() error {
 	if config.ConnectionTimeout == 0 {
 		config.ConnectionTimeout = 300 // 5 minutes
 	}
-	if config.RetryAttempts == 0 {
+	if config.RetryAttempts < 1 {
 		config.RetryAttempts = 3
 	}
 	if config.RetryInitialDelay == 0 {

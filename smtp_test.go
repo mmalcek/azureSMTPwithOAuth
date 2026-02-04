@@ -407,3 +407,102 @@ func TestParseSubjectBodyAndAttachments_InlineImage(t *testing.T) {
 		t.Errorf("expected regular attachment filename 'report.pdf', got '%s'", regularAtt.Filename)
 	}
 }
+
+func TestDecodeBase64WithError_Standard(t *testing.T) {
+	encoded := base64.StdEncoding.EncodeToString([]byte("test value"))
+	decoded, err := decodeBase64WithError(encoded)
+	if err != nil {
+		t.Fatalf("decodeBase64WithError failed: %v", err)
+	}
+	if decoded != "test value" {
+		t.Errorf("expected 'test value', got '%s'", decoded)
+	}
+}
+
+func TestDecodeBase64WithError_NoPadding(t *testing.T) {
+	// Encode without padding (some SMTP clients do this)
+	encoded := base64.RawStdEncoding.EncodeToString([]byte("test value"))
+	// Verify it has no padding
+	if strings.HasSuffix(encoded, "=") {
+		t.Fatal("test setup error: encoded string should not have padding")
+	}
+	decoded, err := decodeBase64WithError(encoded)
+	if err != nil {
+		t.Fatalf("decodeBase64WithError with no padding failed: %v", err)
+	}
+	if decoded != "test value" {
+		t.Errorf("expected 'test value', got '%s'", decoded)
+	}
+}
+
+func TestDecodeBase64WithError_Invalid(t *testing.T) {
+	_, err := decodeBase64WithError("not!valid!base64!!!")
+	if err == nil {
+		t.Error("expected error for invalid base64, got nil")
+	}
+}
+
+func TestExtractAddress_AngleBrackets(t *testing.T) {
+	addr := extractAddress("MAIL FROM:<user@example.com>")
+	if addr != "user@example.com" {
+		t.Errorf("expected 'user@example.com', got '%s'", addr)
+	}
+}
+
+func TestExtractAddress_AngleBracketsWithParams(t *testing.T) {
+	addr := extractAddress("MAIL FROM:<user@example.com> SIZE=12345")
+	if addr != "user@example.com" {
+		t.Errorf("expected 'user@example.com', got '%s'", addr)
+	}
+}
+
+func TestExtractAddress_FallbackWithParameters(t *testing.T) {
+	// Without angle brackets, fallback path should strip SMTP parameters
+	addr := extractAddress("MAIL FROM: user@example.com SIZE=12345")
+	if addr != "user@example.com" {
+		t.Errorf("expected 'user@example.com', got '%s'", addr)
+	}
+}
+
+func TestExtractAddress_FallbackSimple(t *testing.T) {
+	addr := extractAddress("MAIL FROM: user@example.com")
+	if addr != "user@example.com" {
+		t.Errorf("expected 'user@example.com', got '%s'", addr)
+	}
+}
+
+func TestExtractAddress_Empty(t *testing.T) {
+	addr := extractAddress("MAIL FROM:<>")
+	if addr != "" {
+		t.Errorf("expected empty string, got '%s'", addr)
+	}
+}
+
+func TestIsValidEmail_Valid(t *testing.T) {
+	valid := []string{
+		"user@example.com",
+		"a@b.co",
+		"user.name+tag@domain.org",
+	}
+	for _, email := range valid {
+		if !isValidEmail(email) {
+			t.Errorf("expected '%s' to be valid", email)
+		}
+	}
+}
+
+func TestIsValidEmail_Invalid(t *testing.T) {
+	invalid := []string{
+		"",
+		"@example.com",
+		"user@",
+		"user@domain",
+		"user",
+		strings.Repeat("a", 65) + "@example.com",
+	}
+	for _, email := range invalid {
+		if isValidEmail(email) {
+			t.Errorf("expected '%s' to be invalid", email)
+		}
+	}
+}

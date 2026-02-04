@@ -25,7 +25,7 @@ type program struct {
 	connSem  chan struct{}
 }
 
-const version = "1.1.0"
+const version = "1.1.1"
 
 var (
 	logFile    *os.File
@@ -47,13 +47,14 @@ func (p *program) run() {
 	var err error
 	p.listener, err = net.Listen("tcp", config.ListenAddr)
 	if err != nil {
-		log.Fatalf("Failed to listen: %v", err)
+		logger.Error("Failed to listen", "error", err)
+		return
 	}
 
 	logger.Info("SMTP relay listening", "address", config.ListenAddr, "max_connections", config.MaxConnections)
 
 	// Start token cache cleanup
-	StartTokenCacheCleanup(5 * time.Minute)
+	StartTokenCacheCleanup(p.ctx, 5*time.Minute)
 
 	for {
 		// Set accept deadline to check for shutdown periodically

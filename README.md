@@ -132,6 +132,27 @@ All stability options have sensible defaults and are optional. Existing config f
 
 ## Changelog
 
+### v1.1.1
+
+- **Security:** Credentials are no longer logged at DEBUG level during AUTH flow
+- **Security:** Graph API URL now URL-encodes the sender to prevent path injection
+- **Security:** Internal error details are no longer exposed to SMTP clients
+- **Security:** OAuth2 token response body is no longer included in error messages
+- **Bug fix:** Replaced `goto` control flow with proper `continue` after message-too-large rejection
+- **Bug fix:** Guard against zero retry attempts causing nil pointer panic
+- **Bug fix:** MAIL FROM address is now validated with the same rules as RCPT TO
+- **Bug fix:** Token cache expiry now has a minimum of 30 seconds to prevent constant re-fetching
+- **Bug fix:** Token cache cleanup goroutine now stops on service shutdown
+- **Improvement:** Added recipient limit (max 500 per message, matching Graph API limit)
+- **Improvement:** AUTH LOGIN now accepts base64 without padding for broader client compatibility
+- **Improvement:** Replaced `log.Fatalf` in goroutine with graceful error logging
+- **Improvement:** Client disconnections are now logged at DEBUG instead of ERROR level
+- **Improvement:** `extractAddress` now strips SMTP parameters (e.g., `SIZE=12345`) in fallback path
+- **Bug fix:** Fixed Graph API error when all recipients are in CC/BCC (nil `toRecipients`)
+- **Cleanup:** Removed unused `health_addr` config field
+- **Cleanup:** Updated `golang.org/x/sys` dependency from 2020 to v0.40.0
+- Added new unit tests for base64 decoding, address extraction, and email validation
+
 ### v1.1.0
 
 - Added retry logic with exponential backoff for Graph API transient failures
