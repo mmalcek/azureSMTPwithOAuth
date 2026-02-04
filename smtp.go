@@ -504,6 +504,133 @@ type Attachment struct {
 	Filename    string
 	ContentType string
 	Content     string // base64-encoded
+	IsInline    bool   // true for inline images (Content-Disposition: inline)
+	ContentID   string // Content-ID header value (without angle brackets)
+}
+
+// parsedContent holds the accumulated results of recursive multipart parsing
+type parsedContent struct {
+	textBody    string
+	htmlBody    string
+	attachments []Attachment
+	partCount   int
+}
+
+// processMultipart recursively parses a multipart reader and accumulates
+// body text, HTML, and attachments into the parsedContent struct.
+func processMultipart(mr *multipart.Reader, result *parsedContent, depth int) error {
+	const maxParts = 100 // Prevent infinite loops from malformed multipart
+	const maxDepth = 10  // Prevent deeply nested multipart abuse
+
+	if depth > maxDepth {
+		logger.Warn("Multipart nesting depth exceeded", "max", maxDepth)
+		return nil
+	}
+
+	for {
+		p, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			logger.Debug("Multipart parsing ended", "reason", err.Error(), "parts_parsed", result.partCount, "depth", depth)
+			break
+		}
+		result.partCount++
+		if result.partCount > maxParts {
+			logger.Warn("Multipart message exceeded max parts limit", "max", maxParts)
+			break
+		}
+
+		partCT := p.Header.Get("Content-Type")
+		partMediaType, partParams, parseErr := mime.ParseMediaType(partCT)
+		if parseErr != nil {
+			partMediaType = ""
+		}
+
+		// If this part is itself multipart, recurse
+		if strings.HasPrefix(partMediaType, "multipart/") {
+			innerBoundary := partParams["boundary"]
+			if innerBoundary != "" {
+				innerReader := multipart.NewReader(p, innerBoundary)
+				if err := processMultipart(innerReader, result, depth+1); err != nil {
+					return err
+				}
+				continue
+			}
+		}
+
+		disposition := p.Header.Get("Content-Disposition")
+		contentID := p.Header.Get("Content-ID")
+		// Strip angle brackets from Content-ID: <img001> → img001
+		if contentID != "" {
+			contentID = strings.TrimPrefix(contentID, "<")
+			contentID = strings.TrimSuffix(contentID, ">")
+		}
+
+		isAttachment := strings.HasPrefix(disposition, "attachment")
+		isInline := strings.HasPrefix(disposition, "inline") &&
+			contentID != "" &&
+			!strings.HasPrefix(partMediaType, "text/")
+
+		if isAttachment || isInline {
+			filename := p.FileName()
+			// Try to extract filename from Content-Type if still empty
+			if filename == "" {
+				if parseErr == nil {
+					if n, ok := partParams["name"]; ok && n != "" {
+						filename = n
+						logger.Debug("Attachment filename extracted from Content-Type name param", "filename", filename)
+					}
+				}
+			}
+			// Generate a default filename for inline images without one
+			if filename == "" && isInline {
+				filename = contentID
+			}
+			ctype := partCT
+			if ctype == "" {
+				ctype = "application/octet-stream"
+			}
+			attCTE := strings.ToLower(p.Header.Get("Content-Transfer-Encoding"))
+			dataContent, decErr := decodeMessage(attCTE, p)
+			if decErr != nil {
+				if config.StrictAttachments {
+					return fmt.Errorf("failed to decode attachment %q: %w", filename, decErr)
+				}
+				logger.Warn("Failed to decode attachment, skipping", "filename", filename, "error", decErr)
+				continue
+			}
+			if filename == "" || ctype == "" || len(dataContent) == 0 {
+				logger.Warn("Invalid attachment detected, skipping", "filename", filename, "contentType", ctype, "dataLength", len(dataContent))
+				continue
+			}
+			att := Attachment{
+				Filename:    filename,
+				ContentType: ctype,
+				Content:     base64.StdEncoding.EncodeToString(dataContent),
+			}
+			if isInline {
+				att.IsInline = true
+				att.ContentID = contentID
+			}
+			result.attachments = append(result.attachments, att)
+		} else {
+			// Body part (text/plain or text/html)
+			cte := strings.ToLower(p.Header.Get("Content-Transfer-Encoding"))
+			dataContent, decErr := decodeMessage(cte, p)
+			if decErr != nil {
+				logger.Warn("Failed to decode body part", "error", decErr)
+				continue
+			}
+			if strings.Contains(strings.ToLower(partCT), "html") {
+				result.htmlBody = string(dataContent)
+			} else {
+				result.textBody = string(dataContent)
+			}
+		}
+	}
+	return nil
 }
 
 // parseSubjectBodyAndAttachments parses the subject, body, and attachments from a raw SMTP message
@@ -525,85 +652,30 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 	}
 	ct := m.Header.Get("Content-Type")
 	cte := strings.ToLower(m.Header.Get("Content-Transfer-Encoding"))
+
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err == nil && strings.HasPrefix(mediaType, "multipart/") {
+		mr := multipart.NewReader(m.Body, params["boundary"])
+		result := &parsedContent{}
+		if err := processMultipart(mr, result, 0); err != nil {
+			return "", "", false, nil, fmt.Errorf("multipart parsing failed: %w", err)
+		}
+		// Prefer HTML body over plain text
+		if result.htmlBody != "" {
+			body = result.htmlBody
+			isHTML = true
+		} else {
+			body = result.textBody
+		}
+		return subject, body, isHTML, result.attachments, nil
+	}
+	// Not multipart: fallback to old logic
 	if strings.Contains(strings.ToLower(ct), "html") {
 		isHTML = true
 	}
-	mediaType, params, err := mime.ParseMediaType(ct)
-	dataContent := []byte{}
-	if err == nil && strings.HasPrefix(mediaType, "multipart/") {
-		mr := multipart.NewReader(m.Body, params["boundary"])
-		const maxParts = 100 // Prevent infinite loops from malformed multipart
-		partCount := 0
-		for {
-			p, err := mr.NextPart()
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				// On any multipart parsing error (including missing boundary),
-				// log and break instead of hanging
-				logger.Debug("Multipart parsing ended", "reason", err.Error(), "parts_parsed", partCount)
-				break
-			}
-			partCount++
-			if partCount > maxParts {
-				logger.Warn("Multipart message exceeded max parts limit", "max", maxParts)
-				break
-			}
-			// Decode the part's subject if available
-			if strings.HasPrefix(p.Header.Get("Content-Disposition"), "attachment") {
-				filename := p.FileName()
-				// Try to extract filename from Content-Type if still empty
-				if filename == "" {
-					ct := p.Header.Get("Content-Type")
-					_, params, err := mime.ParseMediaType(ct)
-					if err == nil {
-						if n, ok := params["name"]; ok && n != "" {
-							filename = n
-							logger.Debug("Attachment filename extracted from Content-Type name param", "filename", filename)
-						}
-					}
-				}
-				ctype := p.Header.Get("Content-Type")
-				if ctype == "" {
-					ctype = "application/octet-stream"
-				}
-				attCTE := strings.ToLower(p.Header.Get("Content-Transfer-Encoding"))
-				if dataContent, err = decodeMessage(attCTE, p); err != nil {
-					if config.StrictAttachments {
-						return "", "", false, nil, fmt.Errorf("failed to decode attachment %q: %w", filename, err)
-					}
-					logger.Warn("Failed to decode attachment, skipping", "filename", filename, "error", err)
-					continue // skip this attachment if decoding fails
-				}
-				if filename == "" || ctype == "" || len(dataContent) == 0 {
-					logger.Warn("Invalid attachment detected, skipping", "filename", filename, "contentType", ctype, "dataLength", len(dataContent))
-					continue // skip invalid attachments
-				}
-				attachments = append(attachments, Attachment{
-					Filename:    filename,
-					ContentType: ctype,
-					Content:     base64.StdEncoding.EncodeToString(dataContent),
-				})
-			} else {
-				// treat as body part
-				cte := strings.ToLower(p.Header.Get("Content-Transfer-Encoding"))
-				if dataContent, err = decodeMessage(cte, p); err != nil {
-					logger.Warn("Failed to decode body part", "error", err)
-					continue // skip this part if decoding fails
-				}
-				// If the part is HTML, set isHTML flag
-				if strings.Contains(strings.ToLower(p.Header.Get("Content-Type")), "html") {
-					isHTML = true
-				}
-				body = string(dataContent)
-			}
-		}
-		return subject, body, isHTML, attachments, nil
-	}
-	// Not multipart: fallback to old logic
-	if dataContent, err = decodeMessage(cte, m.Body); err != nil {
-		return "", "", false, nil, fmt.Errorf("failed to decode message body: %w", err)
+	dataContent, decErr := decodeMessage(cte, m.Body)
+	if decErr != nil {
+		return "", "", false, nil, fmt.Errorf("failed to decode message body: %w", decErr)
 	}
 
 	return subject, string(dataContent), isHTML, nil, nil
@@ -639,12 +711,17 @@ func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptT
 	}
 	var graphAttachments []map[string]interface{}
 	for _, att := range attachments {
-		graphAttachments = append(graphAttachments, map[string]interface{}{
+		graphAtt := map[string]interface{}{
 			"@odata.type":  "#microsoft.graph.fileAttachment",
 			"name":         att.Filename,
 			"contentType":  att.ContentType,
 			"contentBytes": att.Content,
-		})
+		}
+		if att.IsInline {
+			graphAtt["isInline"] = true
+			graphAtt["contentId"] = att.ContentID
+		}
+		graphAttachments = append(graphAttachments, graphAtt)
 	}
 	if graphAttachments == nil {
 		graphAttachments = make([]map[string]interface{}, 0)

@@ -211,3 +211,199 @@ func TestParseSubjectBodyAndAttachments_EncodedSubject(t *testing.T) {
 		t.Errorf("expected body 'Body', got '%s'", body)
 	}
 }
+
+func TestParseSubjectBodyAndAttachments_NestedMultipartMixedAlternative(t *testing.T) {
+	// Build inner multipart/alternative with text and HTML
+	var innerBuf bytes.Buffer
+	innerWriter := multipart.NewWriter(&innerBuf)
+	innerBoundary := innerWriter.Boundary()
+	textPart, _ := innerWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"text/plain; charset=utf-8"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	textPart.Write([]byte("Plain body"))
+	htmlPart, _ := innerWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"text/html; charset=utf-8"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	htmlPart.Write([]byte("<b>HTML body</b>"))
+	innerWriter.Close()
+
+	// Build outer multipart/mixed with the inner alternative + attachment
+	var outerBuf bytes.Buffer
+	outerWriter := multipart.NewWriter(&outerBuf)
+	outerBoundary := outerWriter.Boundary()
+	altPart, _ := outerWriter.CreatePart(map[string][]string{
+		"Content-Type": {"multipart/alternative; boundary=\"" + innerBoundary + "\""},
+	})
+	altPart.Write(innerBuf.Bytes())
+	attPart, _ := outerWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"application/pdf; name=\"doc.pdf\""},
+		"Content-Disposition":       {"attachment; filename=\"doc.pdf\""},
+		"Content-Transfer-Encoding": {"base64"},
+	})
+	attPart.Write([]byte(base64.StdEncoding.EncodeToString([]byte("pdf content"))))
+	outerWriter.Close()
+
+	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Nested\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + outerBoundary + "\"\r\n\r\n" + outerBuf.String()
+
+	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	if err != nil {
+		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
+	}
+	if subject != "Nested" {
+		t.Errorf("expected subject 'Nested', got '%s'", subject)
+	}
+	if strings.TrimRight(body, "\r\n") != "<b>HTML body</b>" {
+		t.Errorf("expected HTML body '<b>HTML body</b>', got '%s'", body)
+	}
+	if !isHTML {
+		t.Errorf("expected isHTML true, got false")
+	}
+	if len(attachments) != 1 {
+		t.Fatalf("expected 1 attachment, got %d", len(attachments))
+	}
+	if attachments[0].Filename != "doc.pdf" {
+		t.Errorf("expected attachment filename 'doc.pdf', got '%s'", attachments[0].Filename)
+	}
+}
+
+func TestParseSubjectBodyAndAttachments_MultipartAlternativePreferHTML(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	boundary := w.Boundary()
+	textPart, _ := w.CreatePart(map[string][]string{
+		"Content-Type":              {"text/plain"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	textPart.Write([]byte("Plain"))
+	htmlPart, _ := w.CreatePart(map[string][]string{
+		"Content-Type":              {"text/html"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	htmlPart.Write([]byte("<b>HTML</b>"))
+	w.Close()
+
+	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Alt\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
+
+	_, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	if err != nil {
+		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
+	}
+	if strings.TrimRight(body, "\r\n") != "<b>HTML</b>" {
+		t.Errorf("expected body '<b>HTML</b>', got '%s'", body)
+	}
+	if !isHTML {
+		t.Errorf("expected isHTML true, got false")
+	}
+	if len(attachments) != 0 {
+		t.Errorf("expected 0 attachments, got %d", len(attachments))
+	}
+}
+
+func TestParseSubjectBodyAndAttachments_MultipartAlternativePlainOnly(t *testing.T) {
+	var buf bytes.Buffer
+	w := multipart.NewWriter(&buf)
+	boundary := w.Boundary()
+	textPart, _ := w.CreatePart(map[string][]string{
+		"Content-Type":              {"text/plain"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	textPart.Write([]byte("Just plain text"))
+	w.Close()
+
+	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: PlainOnly\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
+
+	_, body, isHTML, _, err := parseSubjectBodyAndAttachments(msg)
+	if err != nil {
+		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
+	}
+	if strings.TrimRight(body, "\r\n") != "Just plain text" {
+		t.Errorf("expected body 'Just plain text', got '%s'", body)
+	}
+	if isHTML {
+		t.Errorf("expected isHTML false, got true")
+	}
+}
+
+func TestParseSubjectBodyAndAttachments_InlineImage(t *testing.T) {
+	imgData := []byte{0x89, 0x50, 0x4E, 0x47} // PNG magic bytes
+	imgB64 := base64.StdEncoding.EncodeToString(imgData)
+
+	// Build multipart/related with HTML body + inline image
+	var relBuf bytes.Buffer
+	relWriter := multipart.NewWriter(&relBuf)
+	relBoundary := relWriter.Boundary()
+	htmlPart, _ := relWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"text/html; charset=utf-8"},
+		"Content-Transfer-Encoding": {"7bit"},
+	})
+	htmlPart.Write([]byte("<html><body><img src=\"cid:img001\"></body></html>"))
+	inlinePart, _ := relWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"image/png; name=\"logo.png\""},
+		"Content-Disposition":       {"inline; filename=\"logo.png\""},
+		"Content-Transfer-Encoding": {"base64"},
+		"Content-Id":                {"<img001>"},
+	})
+	inlinePart.Write([]byte(imgB64))
+	relWriter.Close()
+
+	// Wrap in multipart/mixed with an additional regular attachment
+	var mixedBuf bytes.Buffer
+	mixedWriter := multipart.NewWriter(&mixedBuf)
+	mixedBoundary := mixedWriter.Boundary()
+	relPart, _ := mixedWriter.CreatePart(map[string][]string{
+		"Content-Type": {"multipart/related; boundary=\"" + relBoundary + "\""},
+	})
+	relPart.Write(relBuf.Bytes())
+	attPart, _ := mixedWriter.CreatePart(map[string][]string{
+		"Content-Type":              {"application/pdf; name=\"report.pdf\""},
+		"Content-Disposition":       {"attachment; filename=\"report.pdf\""},
+		"Content-Transfer-Encoding": {"base64"},
+	})
+	attPart.Write([]byte(base64.StdEncoding.EncodeToString([]byte("pdf data"))))
+	mixedWriter.Close()
+
+	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: InlineImg\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + mixedBoundary + "\"\r\n\r\n" + mixedBuf.String()
+
+	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	if err != nil {
+		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
+	}
+	if subject != "InlineImg" {
+		t.Errorf("expected subject 'InlineImg', got '%s'", subject)
+	}
+	if strings.TrimRight(body, "\r\n") != "<html><body><img src=\"cid:img001\"></body></html>" {
+		t.Errorf("expected HTML body with cid reference, got '%s'", body)
+	}
+	if !isHTML {
+		t.Errorf("expected isHTML true, got false")
+	}
+	if len(attachments) != 2 {
+		t.Fatalf("expected 2 attachments, got %d", len(attachments))
+	}
+	// Find inline attachment
+	var inlineAtt, regularAtt *Attachment
+	for i := range attachments {
+		if attachments[i].IsInline {
+			inlineAtt = &attachments[i]
+		} else {
+			regularAtt = &attachments[i]
+		}
+	}
+	if inlineAtt == nil {
+		t.Fatal("expected an inline attachment, found none")
+	}
+	if inlineAtt.ContentID != "img001" {
+		t.Errorf("expected ContentID 'img001', got '%s'", inlineAtt.ContentID)
+	}
+	if inlineAtt.Filename != "logo.png" {
+		t.Errorf("expected inline filename 'logo.png', got '%s'", inlineAtt.Filename)
+	}
+	if regularAtt == nil {
+		t.Fatal("expected a regular attachment, found none")
+	}
+	if regularAtt.Filename != "report.pdf" {
+		t.Errorf("expected regular attachment filename 'report.pdf', got '%s'", regularAtt.Filename)
+	}
+}

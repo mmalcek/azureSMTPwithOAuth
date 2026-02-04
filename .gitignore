@@ -29,3 +29,5 @@ azureSMTPwithOAuth
 test.sh
 testMsg.txt
 debug.log
+
+.claude/
