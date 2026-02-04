@@ -397,8 +397,8 @@ func handleSMTPConnection(conn net.Conn) {
 			msg = strings.ReplaceAll(msg, "\r", "\n")
 			msg = strings.ReplaceAll(msg, "\n", "\r\n")
 
-			// Parse subject, body, and attachments
-			subject, body, isHTML, attachments, parseErr := parseSubjectBodyAndAttachments(msg)
+			// Parse subject, body, CC, BCC, and attachments
+			subject, body, isHTML, attachments, ccAddrs, bccAddrs, parseErr := parseSubjectBodyAndAttachments(msg)
 			if parseErr != nil {
 				fmt.Fprintf(writer, "550 5.6.0 Message parsing failed: %v\r\n", parseErr)
 				writer.Flush()
@@ -417,7 +417,7 @@ func handleSMTPConnection(conn net.Conn) {
 				return
 			}
 
-			if err := sendMailGraphAPI(ctx, token, username, mailFrom, rcptTo, subject, body, isHTML, attachments); err != nil {
+			if err := sendMailGraphAPI(ctx, token, username, mailFrom, rcptTo, ccAddrs, bccAddrs, subject, body, isHTML, attachments); err != nil {
 				cancel()
 				fmt.Fprintf(writer, "550 5.7.0 Delivery failed: %v\r\n", err)
 				writer.Flush()
@@ -633,8 +633,24 @@ func processMultipart(mr *multipart.Reader, result *parsedContent, depth int) er
 	return nil
 }
 
-// parseSubjectBodyAndAttachments parses the subject, body, and attachments from a raw SMTP message
-func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bool, attachments []Attachment, err error) {
+// parseAddressList parses a comma-separated list of email addresses from a header value
+func parseAddressList(header string) []string {
+	if header == "" {
+		return nil
+	}
+	addrs, err := mail.ParseAddressList(header)
+	if err != nil {
+		return nil
+	}
+	var result []string
+	for _, a := range addrs {
+		result = append(result, a.Address)
+	}
+	return result
+}
+
+// parseSubjectBodyAndAttachments parses the subject, body, CC, BCC, and attachments from a raw SMTP message
+func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bool, attachments []Attachment, ccAddrs, bccAddrs []string, err error) {
 	// Ensure message ends with a newline for robust parsing
 	if !strings.HasSuffix(msg, "\n") {
 		msg += "\n"
@@ -642,7 +658,7 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 	r := strings.NewReader(msg)
 	m, err := mail.ReadMessage(r)
 	if err != nil {
-		return "", "", false, nil, fmt.Errorf("mail.ReadMessage failed: %w", err)
+		return "", "", false, nil, nil, nil, fmt.Errorf("mail.ReadMessage failed: %w", err)
 	}
 	wd := new(mime.WordDecoder)
 	subjectRaw := m.Header.Get("Subject")
@@ -650,6 +666,11 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 	if err != nil {
 		subject = subjectRaw // fallback to raw if decode fails
 	}
+
+	// Parse CC and BCC headers
+	ccAddrs = parseAddressList(m.Header.Get("Cc"))
+	bccAddrs = parseAddressList(m.Header.Get("Bcc"))
+
 	ct := m.Header.Get("Content-Type")
 	cte := strings.ToLower(m.Header.Get("Content-Transfer-Encoding"))
 
@@ -658,7 +679,7 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 		mr := multipart.NewReader(m.Body, params["boundary"])
 		result := &parsedContent{}
 		if err := processMultipart(mr, result, 0); err != nil {
-			return "", "", false, nil, fmt.Errorf("multipart parsing failed: %w", err)
+			return "", "", false, nil, nil, nil, fmt.Errorf("multipart parsing failed: %w", err)
 		}
 		// Prefer HTML body over plain text
 		if result.htmlBody != "" {
@@ -667,7 +688,7 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 		} else {
 			body = result.textBody
 		}
-		return subject, body, isHTML, result.attachments, nil
+		return subject, body, isHTML, result.attachments, ccAddrs, bccAddrs, nil
 	}
 	// Not multipart: fallback to old logic
 	if strings.Contains(strings.ToLower(ct), "html") {
@@ -675,10 +696,10 @@ func parseSubjectBodyAndAttachments(msg string) (subject, body string, isHTML bo
 	}
 	dataContent, decErr := decodeMessage(cte, m.Body)
 	if decErr != nil {
-		return "", "", false, nil, fmt.Errorf("failed to decode message body: %w", decErr)
+		return "", "", false, nil, nil, nil, fmt.Errorf("failed to decode message body: %w", decErr)
 	}
 
-	return subject, string(dataContent), isHTML, nil, nil
+	return subject, string(dataContent), isHTML, nil, ccAddrs, bccAddrs, nil
 }
 
 func decodeMessage(c string, r io.Reader) (content []byte, err error) {
@@ -697,15 +718,42 @@ func decodeMessage(c string, r io.Reader) (content []byte, err error) {
 }
 
 // sendMailGraphAPI sends the email via Microsoft Graph API /sendMail with retry logic
-func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptTo []string, subject, body string, isHTML bool, attachments []Attachment) error {
+func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptTo, ccAddrs, bccAddrs []string, subject, body string, isHTML bool, attachments []Attachment) error {
 	graphURL := "https://graph.microsoft.com/v1.0/users/" + sender + "/sendMail"
 	contentType := "text"
 	if isHTML {
 		contentType = "html"
 	}
+
+	// Build a set of CC and BCC addresses to exclude from To recipients
+	ccSet := make(map[string]bool)
+	for _, addr := range ccAddrs {
+		ccSet[strings.ToLower(addr)] = true
+	}
+	bccSet := make(map[string]bool)
+	for _, addr := range bccAddrs {
+		bccSet[strings.ToLower(addr)] = true
+	}
+
 	var toRecipients []map[string]map[string]string
 	for _, addr := range rcptTo {
+		// Skip addresses that are CC or BCC — they'll be added separately
+		if ccSet[strings.ToLower(addr)] || bccSet[strings.ToLower(addr)] {
+			continue
+		}
 		toRecipients = append(toRecipients, map[string]map[string]string{
+			"emailAddress": {"address": addr},
+		})
+	}
+	var ccRecipients []map[string]map[string]string
+	for _, addr := range ccAddrs {
+		ccRecipients = append(ccRecipients, map[string]map[string]string{
+			"emailAddress": {"address": addr},
+		})
+	}
+	var bccRecipients []map[string]map[string]string
+	for _, addr := range bccAddrs {
+		bccRecipients = append(bccRecipients, map[string]map[string]string{
 			"emailAddress": {"address": addr},
 		})
 	}
@@ -726,19 +774,26 @@ func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptT
 	if graphAttachments == nil {
 		graphAttachments = make([]map[string]interface{}, 0)
 	}
-	msg := map[string]interface{}{
-		"message": map[string]interface{}{
-			"subject": subject,
-			"body": map[string]string{
-				"contentType": contentType,
-				"content":     body,
-			},
-			"toRecipients": toRecipients,
-			"from": map[string]map[string]string{
-				"emailAddress": {"address": mailFrom},
-			},
-			"attachments": graphAttachments,
+	message := map[string]interface{}{
+		"subject": subject,
+		"body": map[string]string{
+			"contentType": contentType,
+			"content":     body,
 		},
+		"toRecipients": toRecipients,
+		"from": map[string]map[string]string{
+			"emailAddress": {"address": mailFrom},
+		},
+		"attachments": graphAttachments,
+	}
+	if len(ccRecipients) > 0 {
+		message["ccRecipients"] = ccRecipients
+	}
+	if len(bccRecipients) > 0 {
+		message["bccRecipients"] = bccRecipients
+	}
+	msg := map[string]interface{}{
+		"message":         message,
 		"saveToSentItems": config.SaveToSent,
 	}
 

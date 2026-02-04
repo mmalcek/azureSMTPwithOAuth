@@ -43,7 +43,7 @@ func TestDecodeMessage_Default(t *testing.T) {
 
 func TestParseSubjectBodyAndAttachments_Simple(t *testing.T) {
 	raw := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Hello\r\n\r\nThis is the body."
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(raw)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(raw)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -65,7 +65,7 @@ func TestParseSubjectBodyAndAttachments_Simple(t *testing.T) {
 
 func TestParseSubjectBodyAndAttachments_SimpleHTML(t *testing.T) {
 	raw := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Hello\r\nContent-Type: text/html\r\n\r\n<html><body>Hi!</body></html>"
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(raw)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(raw)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestParseSubjectBodyAndAttachments_MultipartWithAttachment(t *testing.T) {
 	attPart.Write([]byte(attContent))
 	w.Close()
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Multipart\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestParseSubjectBodyAndAttachments_MultipartHTMLBody(t *testing.T) {
 	bodyPart.Write([]byte("<b>HTML Body</b>"))
 	w.Close()
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: HTMLMultipart\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -173,7 +173,7 @@ func TestParseSubjectBodyAndAttachments_MultipartNoBody(t *testing.T) {
 	attPart.Write([]byte(attContent))
 	w.Close()
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: OnlyAttachment\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -200,7 +200,7 @@ func TestParseSubjectBodyAndAttachments_MultipartNoBody(t *testing.T) {
 
 func TestParseSubjectBodyAndAttachments_EncodedSubject(t *testing.T) {
 	raw := "From: test@example.com\r\nTo: you@example.com\r\nSubject: =?UTF-8?B?SGVsbG8g8J+agA==?=\r\n\r\nBody"
-	subject, body, _, _, err := parseSubjectBodyAndAttachments(raw)
+	subject, body, _, _, _, _, err := parseSubjectBodyAndAttachments(raw)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -247,7 +247,7 @@ func TestParseSubjectBodyAndAttachments_NestedMultipartMixedAlternative(t *testi
 
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Nested\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + outerBoundary + "\"\r\n\r\n" + outerBuf.String()
 
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -286,7 +286,7 @@ func TestParseSubjectBodyAndAttachments_MultipartAlternativePreferHTML(t *testin
 
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: Alt\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
 
-	_, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	_, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -314,7 +314,7 @@ func TestParseSubjectBodyAndAttachments_MultipartAlternativePlainOnly(t *testing
 
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: PlainOnly\r\nMIME-Version: 1.0\r\nContent-Type: multipart/alternative; boundary=\"" + boundary + "\"\r\n\r\n" + buf.String()
 
-	_, body, isHTML, _, err := parseSubjectBodyAndAttachments(msg)
+	_, body, isHTML, _, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
@@ -366,7 +366,7 @@ func TestParseSubjectBodyAndAttachments_InlineImage(t *testing.T) {
 
 	msg := "From: test@example.com\r\nTo: you@example.com\r\nSubject: InlineImg\r\nMIME-Version: 1.0\r\nContent-Type: multipart/mixed; boundary=\"" + mixedBoundary + "\"\r\n\r\n" + mixedBuf.String()
 
-	subject, body, isHTML, attachments, err := parseSubjectBodyAndAttachments(msg)
+	subject, body, isHTML, attachments, _, _, err := parseSubjectBodyAndAttachments(msg)
 	if err != nil {
 		t.Fatalf("parseSubjectBodyAndAttachments failed: %v", err)
 	}
