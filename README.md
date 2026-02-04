@@ -20,6 +20,7 @@ SMTP relay service that receives E-mails from SMTP clients and sends them to Off
 - OAuth2 authentication
 - Graph API integration
 - Token cache and renewal. Tokens are stored in memory and renewed automatically.
+- Supports AUTH LOGIN and AUTH PLAIN authentication methods
 - Supports multiple SMTP clients
 - Also works with the "Exchange Online Kiosk" plan, which does not support SMTP OAuth authentication (thanks to Graph API)
 
@@ -131,6 +132,12 @@ All stability options have sensible defaults and are optional. Existing config f
 - If the client provides a username and password, they will be used for authentication. If not, the `fallback_smtp_user` and password will be used.
 
 ## Changelog
+
+### v1.1.2
+
+- **Bug fix:** Fixed double-close on HTTP response body when Graph API retries are exhausted on retryable status codes
+- **Bug fix:** Added RFC 5321 §4.5.2 dot-destuffing in SMTP DATA phase — messages containing lines starting with `.` are no longer corrupted
+- **Feature:** Added AUTH PLAIN support (in addition to AUTH LOGIN) for broader SMTP client compatibility
 
 ### v1.1.1
 

@@ -138,8 +138,13 @@ func doWithRetry(ctx context.Context, client *http.Client, req *http.Request, js
 		}
 
 		logger.Debug("Retryable status received", "attempt", attempt+1, "status", resp.StatusCode)
-		resp.Body.Close() // Close before retry
 		lastErr = fmt.Errorf("retryable status: %d", resp.StatusCode)
+
+		// Close body before retry, but keep last response open for caller
+		if attempt < cfg.MaxAttempts-1 {
+			resp.Body.Close()
+			resp = nil
+		}
 	}
 
 	return resp, lastErr
@@ -215,8 +220,54 @@ func handleSMTPConnection(conn net.Conn) {
 		// Handle EHLO/HELO commands
 		if strings.HasPrefix(strings.ToUpper(line), "EHLO") || strings.HasPrefix(strings.ToUpper(line), "HELO") {
 			// Note: STARTTLS removed as it's not implemented
-			fmt.Fprintf(writer, "250-smtpRelay\r\n250 AUTH LOGIN\r\n")
+			fmt.Fprintf(writer, "250-smtpRelay\r\n250 AUTH LOGIN PLAIN\r\n")
 			writer.Flush()
+			continue
+		}
+
+		if strings.HasPrefix(strings.ToUpper(line), "AUTH PLAIN") {
+			// AUTH PLAIN: base64(\0username\0password) — inline or on next line
+			parts := strings.Fields(line)
+			var plainB64 string
+			if len(parts) >= 3 {
+				plainB64 = parts[2]
+			} else {
+				// Prompt for credentials on next line
+				fmt.Fprintf(writer, "334\r\n")
+				writer.Flush()
+				awaitingAuthData = true
+				nextLine, err := reader.ReadString('\n')
+				if err != nil {
+					logger.Error("Failed to read AUTH PLAIN data", "error", err)
+					fmt.Fprintf(writer, "421 4.7.0 Connection error during authentication\r\n")
+					writer.Flush()
+					return
+				}
+				plainB64 = strings.TrimSpace(nextLine)
+			}
+			decoded, decodeErr := decodeBase64WithError(plainB64)
+			if decodeErr != nil {
+				logger.Error("Invalid base64 in AUTH PLAIN", "error", decodeErr)
+				fmt.Fprintf(writer, "501 5.5.4 Invalid base64 encoding\r\n")
+				writer.Flush()
+				continue
+			}
+			// Format: \0username\0password (authzid is ignored)
+			parts = strings.SplitN(decoded, "\x00", 3)
+			if len(parts) != 3 {
+				logger.Error("Invalid AUTH PLAIN format")
+				fmt.Fprintf(writer, "501 5.5.4 Invalid AUTH PLAIN format\r\n")
+				writer.Flush()
+				continue
+			}
+			username = parts[1]
+			password = parts[2]
+
+			// Validate credentials and authenticate
+			if authErr := authenticateUser(conn, writer, &username, &password); authErr != nil {
+				return
+			}
+			authenticated = true
 			continue
 		}
 
@@ -295,33 +346,10 @@ func handleSMTPConnection(conn net.Conn) {
 				}
 			}
 
-			if username == "" || password == "" {
-				// Use fallback credentials from config if not provided by client
-				if config.FallbackSMTPuser == "" || config.FallbackSMTPpass == "" {
-					fmt.Fprintf(writer, "535 5.7.8 Authentication credentials invalid\r\n")
-					writer.Flush()
-					logger.Error("Authentication failed: no credentials provided")
-					return
-				}
-				logger.Warn("Using fallback credentials - per-user auditing bypassed",
-					"client_ip", conn.RemoteAddr())
-				username = config.FallbackSMTPuser
-				password = config.FallbackSMTPpass
-			}
-
-			// Validate username and password via OAuth2
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			_, err = getCachedOAuth2Token(ctx, username, password)
-			cancel()
-			if err != nil {
-				logger.Error("OAuth2 token retrieval failed", "error", err)
-				fmt.Fprintf(writer, "535 5.7.8 Authentication failed\r\n")
-				writer.Flush()
+			// Validate credentials and authenticate
+			if authErr := authenticateUser(conn, writer, &username, &password); authErr != nil {
 				return
 			}
-			fmt.Fprintf(writer, "235 2.7.0 Authentication successful\r\n")
-			writer.Flush()
-			logger.Debug("User authenticated", "username", username)
 			authenticated = true
 			continue
 		}
@@ -414,6 +442,11 @@ func handleSMTPConnection(conn net.Conn) {
 					break
 				}
 
+				// RFC 5321 §4.5.2: dot-destuffing — remove leading dot from escaped lines
+				if strings.HasPrefix(dataLine, "..") {
+					dataLine = dataLine[1:]
+				}
+
 				messageSize += int64(len(dataLine))
 				if messageSize > config.MaxMessageSize {
 					fmt.Fprintf(writer, "552 5.3.4 Message too large (max %d bytes)\r\n", config.MaxMessageSize)
@@ -487,6 +520,37 @@ func handleSMTPConnection(conn net.Conn) {
 		fmt.Fprintf(writer, "502 5.5.2 Command not implemented\r\n")
 		writer.Flush()
 	}
+}
+
+// authenticateUser validates credentials (using fallback if empty) and performs OAuth2 token check.
+// Returns nil on success. On failure, writes the SMTP error response and returns an error.
+func authenticateUser(conn net.Conn, writer *bufio.Writer, username, password *string) error {
+	if *username == "" || *password == "" {
+		if config.FallbackSMTPuser == "" || config.FallbackSMTPpass == "" {
+			fmt.Fprintf(writer, "535 5.7.8 Authentication credentials invalid\r\n")
+			writer.Flush()
+			logger.Error("Authentication failed: no credentials provided")
+			return fmt.Errorf("no credentials")
+		}
+		logger.Warn("Using fallback credentials - per-user auditing bypassed",
+			"client_ip", conn.RemoteAddr())
+		*username = config.FallbackSMTPuser
+		*password = config.FallbackSMTPpass
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	_, err := getCachedOAuth2Token(ctx, *username, *password)
+	cancel()
+	if err != nil {
+		logger.Error("OAuth2 token retrieval failed", "error", err)
+		fmt.Fprintf(writer, "535 5.7.8 Authentication failed\r\n")
+		writer.Flush()
+		return err
+	}
+	fmt.Fprintf(writer, "235 2.7.0 Authentication successful\r\n")
+	writer.Flush()
+	logger.Debug("User authenticated", "username", *username)
+	return nil
 }
 
 // isValidEmail performs basic email validation
@@ -844,6 +908,9 @@ func sendMailGraphAPI(ctx context.Context, token, sender, mailFrom string, rcptT
 	// Use retry logic for Graph API calls
 	resp, err := doWithRetry(ctx, graphHTTPClient, request, jsonBody, getRetryConfig())
 	if err != nil {
+		if resp != nil {
+			resp.Body.Close()
+		}
 		return fmt.Errorf("Graph API call failed after retries: %w", err)
 	}
 	defer resp.Body.Close()
