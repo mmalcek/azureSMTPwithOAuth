@@ -354,12 +354,19 @@ func handleSMTPConnection(conn net.Conn) {
 			continue
 		}
 
-		// If not authenticated, any command other than AUTH should fail
+		// If not authenticated, check if anonymous access is allowed
 		if !authenticated {
-			logger.Error("Authentication required for command", "command", line)
-			fmt.Fprintf(writer, "530 5.7.0 Authentication required\r\n")
-			writer.Flush()
-			continue
+			if config.AllowAnonymous && config.FallbackSMTPuser != "" && config.FallbackSMTPpass != "" {
+				logger.Warn("Anonymous access - using fallback credentials", "command", line, "remote", conn.RemoteAddr())
+				username = config.FallbackSMTPuser
+				password = config.FallbackSMTPpass
+				authenticated = true
+			} else {
+				logger.Error("Authentication required for command", "command", line)
+				fmt.Fprintf(writer, "530 5.7.0 Authentication required\r\n")
+				writer.Flush()
+				continue
+			}
 		}
 
 		// Handle QUIT, RSET, NOOP commands

@@ -21,6 +21,7 @@ SMTP relay service that receives E-mails from SMTP clients and sends them to Off
 - Graph API integration
 - Token cache and renewal. Tokens are stored in memory and renewed automatically.
 - Supports AUTH LOGIN and AUTH PLAIN authentication methods
+- Supports anonymous (unauthenticated) SMTP clients via fallback credentials
 - Supports multiple SMTP clients
 - Also works with the "Exchange Online Kiosk" plan, which does not support SMTP OAuth authentication (thanks to Graph API)
 
@@ -72,6 +73,7 @@ oauth2_config:
     - https://graph.microsoft.com/.default
 fallback_smtp_user:
 fallback_smtp_pass:
+allow_anonymous: false
 save_to_sent: false
 
 # Stability configuration (optional - all have sensible defaults)
@@ -95,6 +97,7 @@ retry_initial_delay: 500        # Initial retry delay in ms (default: 500)
   - `scopes`: Scopes to request. Default is `https://graph.microsoft.com/.default`.
 - `fallback_smtp_user`: Fallback SMTP user. If set, this user will be used if the SMTP client does not provide a user.
 - `fallback_smtp_pass`: Fallback SMTP password. If set, this password will be used if the SMTP client does not provide a password.
+- `allow_anonymous`: If `true`, clients can send emails without SMTP authentication. The service will use `fallback_smtp_user` and `fallback_smtp_pass` for OAuth2. Requires both fallback credentials to be configured. Default is `false`.
 - `save_to_sent`: If true, the service will save a copy of the sent email to the "Sent Items" folder in Office 365. Default is `false`.
 
 ### Stability Configuration (v1.1.0)
@@ -130,8 +133,13 @@ All stability options have sensible defaults and are optional. Existing config f
 - Set the SMTP server to the address and port specified in `listen_addr` (default is `127.0.0.1:2526`).
 - StartTLS is not supported, so ensure your SMTP client is configured to connect without encryption.
 - If the client provides a username and password, they will be used for authentication. If not, the `fallback_smtp_user` and password will be used.
+- If `allow_anonymous: true`, clients that cannot perform SMTP AUTH (e.g., printers, scanners, legacy devices) can send emails without authentication. The service uses fallback credentials for OAuth2 in this case.
 
 ## Changelog
+
+### v1.1.3
+
+- **Feature:** Added `allow_anonymous` option — allows unauthenticated SMTP clients (printers, scanners, legacy devices) to send emails using fallback credentials
 
 ### v1.1.2
 

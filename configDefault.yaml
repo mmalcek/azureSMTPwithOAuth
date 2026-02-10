@@ -9,4 +9,5 @@ oauth2_config:
         - https://graph.microsoft.com/.default
 fallback_smtp_user: user@domain.com
 fallback_smtp_pass: supersecret
+allow_anonymous: false
 save_to_sent: false

@@ -1,12 +1,149 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"encoding/base64"
+	"log/slog"
 	"mime/multipart"
+	"net"
 	"strings"
 	"testing"
 )
+
+// initTestConfig sets up global config and logger for SMTP handler tests
+func initTestConfig(allowAnonymous bool) {
+	config = &tConfig{
+		ListenAddr:        "127.0.0.1:2526",
+		FallbackSMTPuser:  "fallback@example.com",
+		FallbackSMTPpass:  "fallbackpass",
+		AllowAnonymous:    allowAnonymous,
+		MaxMessageSize:    25 * 1024 * 1024,
+		MaxConnections:    100,
+		ConnectionTimeout: 300,
+		RetryAttempts:     3,
+		RetryInitialDelay: 500,
+		OAuth2Config: tOAuth2Config{
+			ClientID:     "test-client-id",
+			ClientSecret: "test-secret",
+			TenantID:     "test-tenant",
+			Scopes:       []string{"https://graph.microsoft.com/.default"},
+		},
+	}
+	logger = slog.New(slog.NewTextHandler(&bytes.Buffer{}, &slog.HandlerOptions{Level: slog.LevelDebug}))
+}
+
+// readResponse reads a single SMTP response line from the connection
+func readResponse(reader *bufio.Reader) string {
+	line, _ := reader.ReadString('\n')
+	return strings.TrimRight(line, "\r\n")
+}
+
+func TestAnonymousAccess_Allowed(t *testing.T) {
+	initTestConfig(true)
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go handleSMTPConnection(server)
+
+	reader := bufio.NewReader(client)
+
+	// Read greeting
+	resp := readResponse(reader)
+	if !strings.HasPrefix(resp, "220") {
+		t.Fatalf("expected 220 greeting, got: %s", resp)
+	}
+
+	// Send EHLO
+	client.Write([]byte("EHLO test\r\n"))
+	resp = readResponse(reader) // 250-smtpRelay
+	readResponse(reader)        // 250 AUTH LOGIN PLAIN
+
+	// Send MAIL FROM without authenticating
+	client.Write([]byte("MAIL FROM:<sender@example.com>\r\n"))
+	resp = readResponse(reader)
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("expected 250 OK for anonymous MAIL FROM, got: %s", resp)
+	}
+
+	// Send RCPT TO
+	client.Write([]byte("RCPT TO:<recipient@example.com>\r\n"))
+	resp = readResponse(reader)
+	if !strings.HasPrefix(resp, "250") {
+		t.Errorf("expected 250 OK for RCPT TO, got: %s", resp)
+	}
+
+	client.Write([]byte("QUIT\r\n"))
+	resp = readResponse(reader)
+	if !strings.HasPrefix(resp, "221") {
+		t.Errorf("expected 221 Bye, got: %s", resp)
+	}
+}
+
+func TestAnonymousAccess_Denied(t *testing.T) {
+	initTestConfig(false)
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go handleSMTPConnection(server)
+
+	reader := bufio.NewReader(client)
+
+	// Read greeting
+	resp := readResponse(reader)
+	if !strings.HasPrefix(resp, "220") {
+		t.Fatalf("expected 220 greeting, got: %s", resp)
+	}
+
+	// Send EHLO
+	client.Write([]byte("EHLO test\r\n"))
+	readResponse(reader) // 250-smtpRelay
+	readResponse(reader) // 250 AUTH LOGIN PLAIN
+
+	// Send MAIL FROM without authenticating - should be rejected
+	client.Write([]byte("MAIL FROM:<sender@example.com>\r\n"))
+	resp = readResponse(reader)
+	if !strings.HasPrefix(resp, "530") {
+		t.Errorf("expected 530 Authentication required, got: %s", resp)
+	}
+
+	client.Write([]byte("QUIT\r\n"))
+	// When not authenticated, QUIT also gets 530, then client disconnects
+	readResponse(reader)
+}
+
+func TestAnonymousAccess_DeniedWhenNoFallbackCredentials(t *testing.T) {
+	initTestConfig(true)
+	config.FallbackSMTPuser = ""
+	config.FallbackSMTPpass = ""
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	go handleSMTPConnection(server)
+
+	reader := bufio.NewReader(client)
+
+	// Read greeting
+	readResponse(reader)
+
+	// Send EHLO
+	client.Write([]byte("EHLO test\r\n"))
+	readResponse(reader) // 250-smtpRelay
+	readResponse(reader) // 250 AUTH LOGIN PLAIN
+
+	// Should be rejected even with allow_anonymous since no fallback creds
+	client.Write([]byte("MAIL FROM:<sender@example.com>\r\n"))
+	resp := readResponse(reader)
+	if !strings.HasPrefix(resp, "530") {
+		t.Errorf("expected 530 when allow_anonymous but no fallback creds, got: %s", resp)
+	}
+
+	client.Write([]byte("QUIT\r\n"))
+	readResponse(reader)
+}
 
 func TestDecodeMessage_Base64(t *testing.T) {
 	input := base64.StdEncoding.EncodeToString([]byte("hello world"))

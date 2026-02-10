@@ -17,6 +17,7 @@ type tConfig struct {
 	OAuth2Config     tOAuth2Config `yaml:"oauth2_config"`
 	FallbackSMTPuser string        `yaml:"fallback_smtp_user"`
 	FallbackSMTPpass string        `yaml:"fallback_smtp_pass"`
+	AllowAnonymous   bool          `yaml:"allow_anonymous"`
 	SaveToSent       bool          `yaml:"save_to_sent"`
 
 	// Stability configuration (all have sensible defaults)

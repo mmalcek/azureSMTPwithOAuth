@@ -41,6 +41,31 @@ Hello from azureSMTPwithOAuth!
 server.quit()
 ```
 
+### Anonymous send (allow_anonymous: true)
+
+When `allow_anonymous: true` and fallback credentials are configured, clients can send without AUTH:
+
+```python
+import smtplib
+
+server = smtplib.SMTP('127.0.0.1', 2526, timeout=30)
+server.ehlo()
+# No login needed - uses fallback credentials automatically
+server.sendmail('sender@domain.com', ['recipient@example.com'], """From: sender@domain.com
+To: recipient@example.com
+Subject: Anonymous test
+
+Hello from anonymous device!
+""")
+server.quit()
+```
+
+Or with PowerShell (no `-Credential` needed):
+
+```powershell
+Send-MailMessage -From 'sender@domain.com' -To 'recipient@example.com' -Subject 'Test' -Body 'Hello' -SmtpServer '127.0.0.1' -Port 2526
+```
+
 ### HTML email
 
 Set `Content-Type: text/html` header in the message body.
@@ -92,6 +117,7 @@ log: ""                        # Empty = stdout
 log_level: "info"              # debug, info, warn, error
 fallback_smtp_user: ""         # Used when client sends empty credentials
 fallback_smtp_pass: ""
+allow_anonymous: false         # Allow unauthenticated clients (uses fallback credentials)
 save_to_sent: false            # Save to Office 365 Sent Items
 max_message_size: 26214400     # 25MB
 max_connections: 100
@@ -119,10 +145,11 @@ retry_initial_delay: 500       # Milliseconds
 
 ## Test coverage
 
-Tests cover MIME parsing and content decoding only:
+Tests cover MIME parsing, content decoding, and anonymous access:
 - Base64, quoted-printable, and plain text decoding
 - Simple text and HTML email parsing
 - Multipart messages with/without attachments
 - RFC 2047 encoded subjects (e.g., UTF-8/base64)
+- Anonymous SMTP access (allowed, denied, denied without fallback credentials)
 
-Not covered: SMTP protocol handling, OAuth2 flow, Graph API integration, service lifecycle.
+Not covered: OAuth2 flow, Graph API integration, service lifecycle.
